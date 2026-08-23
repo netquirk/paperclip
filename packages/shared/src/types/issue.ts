@@ -662,6 +662,19 @@ export interface IssueExecutionMonitorPolicy {
   timeoutAt?: string | null;
   maxAttempts?: number | null;
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;
+  /**
+   * Number of consecutive greens the monitor must accumulate before its cadence
+   * drops to `slowdownCadenceSeconds`. `null`/absent disables the slowdown.
+   * The monitor agent updates `consecutiveGreens` on `IssueExecutionMonitorState`;
+   * the framework only consults the value, it never derives it itself.
+   */
+  slowdownAfterGreens?: number | null;
+  /**
+   * Reduced cadence (in seconds) used once `slowdownAfterGreens` is reached AND
+   * `deployConfirmed` is true on the persisted monitor state. Ignored when
+   * `slowdownAfterGreens` is absent. Required to be > 0 when set.
+   */
+  slowdownCadenceSeconds?: number | null;
 }
 
 export interface IssueExecutionPolicy {
@@ -694,6 +707,22 @@ export interface IssueExecutionMonitorState {
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;
   clearedAt: string | null;
   clearReason: IssueExecutionMonitorClearReason | null;
+  /**
+   * Most-recent consecutive-green count as observed by the monitor agent. The
+   * framework never mutates this — the agent PATCHes `executionState.monitor`
+   * to advance it. Reset to 0 on the first non-green tick so a streak never
+   * persists past a regression. Used together with `deployConfirmed` to
+   * decide whether the monitor's slowdown cadence should engage.
+   */
+  consecutiveGreens?: number | null;
+  /**
+   * Whether the monitor agent has confirmed the underlying deploy/binary is
+   * healthy (i.e. the post-deploy signal is real and not a stale pre-deploy
+   * read). Required to be true before the slowdown cadence engages.
+   */
+  deployConfirmed?: boolean | null;
+  /** Timestamp of the most recent observed green, when this state last advanced. */
+  lastGreenAt?: string | null;
 }
 
 export interface IssueReviewRequest {

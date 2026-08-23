@@ -100,6 +100,8 @@ function monitorMetadataFromPolicy(monitor: IssueExecutionMonitorPolicy) {
     timeoutAt: monitor.timeoutAt ?? null,
     maxAttempts: monitor.maxAttempts ?? null,
     recoveryPolicy: monitor.recoveryPolicy ?? null,
+    slowdownAfterGreens: monitor.slowdownAfterGreens ?? null,
+    slowdownCadenceSeconds: monitor.slowdownCadenceSeconds ?? null,
   };
 }
 
@@ -111,6 +113,9 @@ function monitorMetadataFromState(state: IssueExecutionMonitorState | null | und
     timeoutAt: state?.timeoutAt ?? null,
     maxAttempts: state?.maxAttempts ?? null,
     recoveryPolicy: state?.recoveryPolicy ?? null,
+    consecutiveGreens: state?.consecutiveGreens ?? null,
+    deployConfirmed: state?.deployConfirmed ?? null,
+    lastGreenAt: state?.lastGreenAt ?? null,
   };
 }
 
@@ -214,6 +219,9 @@ function buildScheduledMonitorState(
   previous: IssueExecutionMonitorState | null,
   monitor: IssueExecutionMonitorPolicy,
 ): IssueExecutionMonitorState {
+  // Agent-owned green/deploy signals must survive a policy-driven reschedule,
+  // otherwise every framework-side `executionPolicy.monitor` PATCH would wipe
+  // the streak and the slowdown cadence could never engage.
   return {
     status: "scheduled",
     nextCheckAt: monitor.nextCheckAt,
@@ -222,6 +230,9 @@ function buildScheduledMonitorState(
     notes: monitor.notes ?? null,
     scheduledBy: monitor.scheduledBy,
     ...monitorMetadataFromPolicy(monitor),
+    consecutiveGreens: previous?.consecutiveGreens ?? null,
+    deployConfirmed: previous?.deployConfirmed ?? null,
+    lastGreenAt: previous?.lastGreenAt ?? null,
     clearedAt: null,
     clearReason: null,
   };
@@ -395,6 +406,8 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
       timeoutAt: parsed.data.monitor.timeoutAt ?? null,
       maxAttempts: parsed.data.monitor.maxAttempts ?? null,
       recoveryPolicy: parsed.data.monitor.recoveryPolicy ?? null,
+      slowdownAfterGreens: parsed.data.monitor.slowdownAfterGreens ?? null,
+      slowdownCadenceSeconds: parsed.data.monitor.slowdownCadenceSeconds ?? null,
     }
     : null;
 
