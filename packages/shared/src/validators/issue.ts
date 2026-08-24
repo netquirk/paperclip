@@ -420,6 +420,7 @@ export const issueExecutionMonitorPolicySchema = z.object({
   recoveryPolicy: z.enum(ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES).optional().nullable().default(null),
   slowdownAfterGreens: z.number().int().nonnegative().max(1000).optional().nullable().default(null),
   slowdownCadenceSeconds: z.number().int().positive().max(24 * 60 * 60).optional().nullable().default(null),
+  slowdownAfterInReviewSeconds: z.number().int().positive().max(7 * 24 * 60 * 60).optional().nullable().default(null),
 }).superRefine((value, ctx) => {
   if (value.slowdownAfterGreens != null && value.slowdownCadenceSeconds == null) {
     ctx.addIssue({
@@ -494,6 +495,7 @@ export const issueExecutionMonitorStateSchema = z.object({
   consecutiveGreens: z.number().int().nonnegative().max(1000).nullable().optional().default(null),
   deployConfirmed: z.boolean().nullable().optional().default(null),
   lastGreenAt: z.string().datetime().nullable().optional().default(null),
+  inReviewSinceAt: z.string().datetime().nullable().optional().default(null),
 });
 
 export const issueReviewRequestSchema = z

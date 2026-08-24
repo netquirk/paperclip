@@ -675,6 +675,16 @@ export interface IssueExecutionMonitorPolicy {
    * `slowdownAfterGreens` is absent. Required to be > 0 when set.
    */
   slowdownCadenceSeconds?: number | null;
+  /**
+   * NET-2044: minimum number of seconds the issue must have been `in_review`
+   * before the slowdown cadence engages. Combined with `slowdownAfterGreens` /
+   * `deployConfirmed` to preserve a tight initial cadence window for fast
+   * signals (e.g. NET-1244 trader post-deploy monitor wants to keep waking
+   * every ~5min for the first hour after `in_review`, then stretch to the
+   * `slowdownCadenceSeconds`). `null`/absent disables this gate — only the
+   * green/deploy gates apply. Required to be > 0 when set.
+   */
+  slowdownAfterInReviewSeconds?: number | null;
 }
 
 export interface IssueExecutionPolicy {
@@ -723,6 +733,16 @@ export interface IssueExecutionMonitorState {
   deployConfirmed?: boolean | null;
   /** Timestamp of the most recent observed green, when this state last advanced. */
   lastGreenAt?: string | null;
+  /**
+   * NET-2044: ISO timestamp at which the issue entered `in_review`. The
+   * monitor agent owns this signal — set it when the issue flips to
+   * `in_review` (and clear it when it leaves). Combined with the policy
+   * field `slowdownAfterInReviewSeconds` to gate the slowdown cadence so
+   * that the first hour of a long `in_review` hold keeps its fast cadence
+   * for fast-signal capture. Null/absent means "no in_review tenure" — the
+   * framework treats that as not-yet-eligible for the in-review gate.
+   */
+  inReviewSinceAt?: string | null;
 }
 
 export interface IssueReviewRequest {
