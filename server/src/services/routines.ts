@@ -525,6 +525,14 @@ function createRoutineDispatchFingerprint(input: {
   executionWorkspaceSettings?: Record<string, unknown> | null;
   title: string;
   description: string | null;
+  // Per-fire identity (NET-6788 / NET-6789): mixes a fresh occurrenceId into the
+  // hash so two cron ticks of the same routine revision produce distinct
+  // fingerprints. This prevents the partial unique index
+  // `issues_open_routine_execution_uq` from wedging when a second fire tries to
+  // assign `execution_run_id`. For idempotency replays we deliberately reuse
+  // the original run's fingerprint so a webhook replay hashes identically and
+  // coalesces against the original issue.
+  dispatchOccurrenceId: string;
 }) {
   const canonical = JSON.stringify(normalizeRoutineDispatchFingerprintValue(input));
   return crypto.createHash("sha256").update(canonical).digest("hex");
@@ -1489,23 +1497,21 @@ export function routineService(
     return run;
   }
 
-  function routineExecutionFingerprintCondition(dispatchFingerprint?: string | null) {
-    if (!dispatchFingerprint) return null;
-    // The "default" arm preserves coalescing against pre-migration open issues.
-    // It becomes inert once those legacy routine execution issues drain out.
-    return or(
-      eq(issues.originFingerprint, dispatchFingerprint),
-      eq(issues.originFingerprint, "default"),
-    );
-  }
-
   async function findLiveExecutionIssue(
     routine: typeof routines.$inferSelect,
     executor: Db = db,
-    dispatchFingerprint?: string | null,
     origin?: { kind: string; id: string | null },
   ) {
-    const fingerprintCondition = routineExecutionFingerprintCondition(dispatchFingerprint);
+    // NET-6788 / NET-6789: dispatch fingerprints are now per-fire (each cron
+    // tick mints a fresh occurrenceId, mixed into the hash), so the lookup no
+    // longer needs to filter on `origin_fingerprint`. Two fires of the same
+    // routine revision will collide on (originKind, originId) only when the
+    // prior issue is still actively held by a heartbeat run — which is the
+    // correct `coalesce_if_active` / `skip_if_active` semantics. The earlier
+    // `routineExecutionFingerprintCondition` "default" back-compat OR was
+    // actively wrong once new fires stopped hashing to "default" and is
+    // removed. Open issues with origin_fingerprint = 'default' that pre-date
+    // this fix are drained by migration 0217.
     const originKind = origin?.kind ?? "routine_execution";
     const originId = origin?.id ?? routine.id;
     const executionBoundIssue = await executor
@@ -1525,7 +1531,6 @@ export function routineService(
           eq(issues.originId, originId),
           inArray(issues.status, OPEN_ISSUE_STATUSES),
           visibleIssueCondition(),
-          ...(fingerprintCondition ? [fingerprintCondition] : []),
         ),
       )
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
@@ -1533,7 +1538,7 @@ export function routineService(
       .then((rows) => rows[0]?.issues ?? null);
     if (executionBoundIssue) return executionBoundIssue;
 
-    return executor
+    const contextBoundIssue = await executor
       .select()
       .from(issues)
       .innerJoin(
@@ -1551,12 +1556,47 @@ export function routineService(
           eq(issues.originId, originId),
           inArray(issues.status, OPEN_ISSUE_STATUSES),
           visibleIssueCondition(),
-          ...(fingerprintCondition ? [fingerprintCondition] : []),
         ),
       )
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
       .limit(1)
       .then((rows) => rows[0]?.issues ?? null);
+    if (contextBoundIssue) return contextBoundIssue;
+
+    // NET-6057: when the heartbeat bound to a routine execution issue has already
+    // terminated (e.g. acpx_turn_failed transitions the issue to `blocked` and
+    // clears `execution_run_id`), the two heartbeat-bound queries above both
+    // return NULL even though the issue is still in OPEN_ISSUE_STATUSES. The
+    // next cron tick would then create a duplicate root and re-enter the same
+    // failure. For skip_if_active / coalesce_if_active routines, fall back to a
+    // heartbeat-free lookup restricted to `blocked` — the stranded state produced
+    // by the failing-execution path — so a stranded execution still suppresses a
+    // new fire. `todo`/`backlog`/`in_progress`/`in_review` are intentionally
+    // excluded so an "open but idle" prior issue (no wakeup yet, or wakeup lost)
+    // still allows a fresh issue. `always_enqueue` is intentionally exempt so it
+    // can always create a new issue.
+    if (
+      routine.concurrencyPolicy === "skip_if_active" ||
+      routine.concurrencyPolicy === "coalesce_if_active"
+    ) {
+      return executor
+        .select()
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, routine.companyId),
+            eq(issues.originKind, originKind),
+            eq(issues.originId, originId),
+            eq(issues.status, "blocked"),
+            visibleIssueCondition(),
+          ),
+        )
+        .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+    }
+
+    return null;
   }
 
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
@@ -1760,25 +1800,19 @@ export function routineService(
       : "routine_execution";
     const issueOriginId = managedIssueTemplate?.originId ?? input.routine.id;
     const issueBillingCode = managedIssueTemplate?.billingCode ?? null;
-    const dispatchFingerprint = createRoutineDispatchFingerprint({
-      payload: triggerPayload,
-      projectId,
-      projectWorkspaceId,
-      assigneeAgentId,
-      routineRevisionId: input.routine.latestRevisionId,
-      routineEnvFingerprint: createRoutineEnvFingerprint(input.routine.env),
-      executionWorkspaceId: input.executionWorkspaceId ?? null,
-      executionWorkspacePreference: input.executionWorkspacePreference ?? null,
-      executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
-      title,
-      description,
-    });
+    // NET-6788 / NET-6789: mint a per-fire occurrenceId BEFORE computing the
+    // fingerprint so the fingerprint is unique per fire. Stable inputs (payload,
+    // revision, env, workspace, assignee) keep distinct revisions/envs from
+    // collapsing into the same slot; the occurrenceId is what gives each cron
+    // tick its own slot.
+    const dispatchOccurrenceId = crypto.randomUUID();
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(
         sql`select id from ${routines} where ${routines.id} = ${input.routine.id} and ${routines.companyId} = ${input.routine.companyId} for update`,
       );
 
+      let dispatchFingerprint: string;
       if (input.idempotencyKey) {
         const existing = await txDb
           .select()
@@ -1799,9 +1833,31 @@ export function routineService(
           if (input.rejectIdempotencyReplay) {
             throw conflict("Webhook replay detected");
           }
+          // Reuse the original run's fingerprint (it already mixes in the
+          // original occurrenceId). A webhook replay therefore hashes
+          // identically and coalesces against the original issue via the
+          // issue-creation catch block below. This is what makes the
+          // `always_enqueue` path's "two writes for one logical fire" semantics
+          // idempotent under replay.
           return existing;
         }
       }
+
+      // First-time fire: compute a fresh fingerprint from a fresh occurrenceId.
+      dispatchFingerprint = createRoutineDispatchFingerprint({
+        payload: triggerPayload,
+        projectId,
+        projectWorkspaceId,
+        assigneeAgentId,
+        routineRevisionId: input.routine.latestRevisionId,
+        routineEnvFingerprint: createRoutineEnvFingerprint(input.routine.env),
+        executionWorkspaceId: input.executionWorkspaceId ?? null,
+        executionWorkspacePreference: input.executionWorkspacePreference ?? null,
+        executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+        title,
+        description,
+        dispatchOccurrenceId,
+      });
 
       const triggeredAt = new Date();
       const manualRunnerUserId = input.source === "manual" ? input.actor?.userId ?? null : null;
@@ -1837,6 +1893,7 @@ export function routineService(
           idempotencyKey: input.idempotencyKey ?? null,
           triggerPayload,
           dispatchFingerprint,
+          dispatchOccurrenceId,
           routineRevisionId: input.routine.latestRevisionId,
           responsibleUserId,
         })
@@ -1850,7 +1907,7 @@ export function routineService(
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
-        const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+        const activeIssue = await findLiveExecutionIssue(input.routine, txDb, {
           kind: issueOriginKind,
           id: issueOriginId,
         });
@@ -1917,7 +1974,7 @@ export function routineService(
             throw error;
           }
 
-          const existingIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+          const existingIssue = await findLiveExecutionIssue(input.routine, txDb, {
             kind: issueOriginKind,
             id: issueOriginId,
           });
