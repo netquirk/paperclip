@@ -50,7 +50,20 @@ UPDATE "issues" AS i
 
 -- Same cleanup for issues whose heartbeat row has already been pruned entirely
 -- (the original `process_lost` reap path). These can never have a live
--- execution run, so unconditionally cancel.
+-- execution run, so it is safe to cancel them.
+--
+-- Predicate: there is NO live heartbeat bound to this issue. Concretely:
+--   * `i.execution_run_id IS NULL` — the FK was nulled (most process_lost
+--     reaps null the FK on reap, leaving issue.execution_run_id NULL), OR
+--   * `i.execution_run_id` points to a heartbeat row that no longer exists
+--     (the heartbeat row was hard-deleted without nulling the FK — rare, but
+--     possible from older operator cleanup paths). A correlated NOT EXISTS
+--     against heartbeat_runs covers that orphan-FK case so we still cancel
+--     the stranded issue rather than leave it wedging the index.
+--
+-- Critically, this update EXCLUDES any issue whose execution_run_id still
+-- points to a live (non-terminal, existing) heartbeat run — cancelling such
+-- an issue would be the exact dispatch wedge the PR claims to fix.
 UPDATE "issues" AS i
    SET "execution_run_id" = NULL,
        "execution_agent_name_key" = NULL,
@@ -60,5 +73,11 @@ UPDATE "issues" AS i
        "cancelled_at" = now()
  WHERE i."origin_kind" = 'routine_execution'
    AND i."origin_fingerprint" = 'default'
+   AND (
+     i."execution_run_id" IS NULL
+     OR NOT EXISTS (
+       SELECT 1 FROM "heartbeat_runs" hr2 WHERE hr2."id" = i."execution_run_id"
+     )
+   )
    AND i."hidden_at" IS NULL
    AND i."status" NOT IN ('done','cancelled');
