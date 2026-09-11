@@ -525,21 +525,42 @@ function createRoutineDispatchFingerprint(input: {
   executionWorkspaceSettings?: Record<string, unknown> | null;
   title: string;
   description: string | null;
+  // Per-fire identity (NET-6788 / NET-6789): mixes a fresh occurrenceId into
+  // the hash so two cron ticks of the same routine revision produce distinct
+  // fingerprints. This is what `routine_runs.dispatch_fingerprint` and the
+  // per-fire `issues.origin_fingerprint` write use, and it prevents the
+  // partial unique index `issues_open_routine_execution_uq` from wedging when
+  // two fires race. The wedge is also recoverable via the existing 23505
+  // catch path; per-fire uniqueness is defense-in-depth.
+  dispatchOccurrenceId: string;
 }) {
-  // The fingerprint is intentionally STABLE across fires of the same routine
-  // revision (same payload + revision + env + workspace + assignee + title +
-  // description) so the lookup in findLiveExecutionIssue can discriminate
-  // between different resolved variables (e.g. `branch: feature/a` vs
-  // `branch: feature/b`) while still coalescing two cron ticks of the same
-  // revision via the heartbeat-bound path. Per-fire identity is recorded in
-  // `routine_runs.dispatch_occurrence_id` (NET-6788 / NET-6789) for
-  // debuggability; the partial unique index `issues_open_routine_execution_uq`
-  // is satisfied within the dispatch transaction's row lock on `routines.id`,
-  // so the second fire's lookup coalesces before any INSERT.
-  //
   // For idempotency replays we deliberately reuse the original run's
   // fingerprint so a webhook replay hashes identically and coalesces against
   // the original issue.
+  const canonical = JSON.stringify(normalizeRoutineDispatchFingerprintValue(input));
+  return crypto.createHash("sha256").update(canonical).digest("hex");
+}
+
+// STABLE dispatch fingerprint: same inputs as `createRoutineDispatchFingerprint`
+// but WITHOUT the per-fire occurrenceId. Two fires of the same routine revision
+// with the same resolved variables hash to the same stable fingerprint, which
+// is what the lookup in `findLiveExecutionIssue` compares against
+// `issues.origin_fingerprint_stable` to discriminate between different
+// resolved variables (e.g. `branch: feature/a` vs `branch: feature/b`) while
+// still coalescing same-variable fires via the heartbeat-bound path.
+function createRoutineDispatchStableFingerprint(input: {
+  payload: Record<string, unknown> | null;
+  projectId: string | null;
+  projectWorkspaceId: string | null;
+  assigneeAgentId: string | null;
+  routineRevisionId: string | null;
+  routineEnvFingerprint: string | null;
+  executionWorkspaceId?: string | null;
+  executionWorkspacePreference?: string | null;
+  executionWorkspaceSettings?: Record<string, unknown> | null;
+  title: string;
+  description: string | null;
+}) {
   const canonical = JSON.stringify(normalizeRoutineDispatchFingerprintValue(input));
   return crypto.createHash("sha256").update(canonical).digest("hex");
 }
@@ -1530,11 +1551,15 @@ export function routineService(
     // `branch: feature/a` vs `branch: feature/b`) coalesced into a single
     // issue.
     //
-    // Restore the fingerprint predicate on all three queries. We compare
-    // against the STABLE dispatch fingerprint (without the per-fire
-    // occurrenceId) so two cron ticks of the same routine revision with the
-    // same variables still coalesce via the heartbeat-bound path. The
-    // `'default'` OR arm preserves coalescing against pre-migration open
+    // The dispatch path now writes TWO fingerprints:
+    //   - `routine_runs.dispatch_fingerprint` / `issues.origin_fingerprint`
+    //     = per-fire (mixed with occurrenceId), preserves the unique-index
+    //     wedge-prevention the e2e tests assert on.
+    //   - STABLE fingerprint (same inputs, no occurrenceId) is what the
+    //     lookup compares against so different resolved variables map to
+    //     different issues. We pass stable as the third arg below.
+    //
+    // The `'default'` OR arm preserves coalescing against pre-migration open
     // issues; migration 0273 drains the residue, after which the arm becomes
     // inert.
     const fingerprintCondition = routineExecutionFingerprintCondition(dispatchFingerprint);
@@ -1874,16 +1899,16 @@ export function routineService(
         }
       }
 
-      // First-time fire: compute a fresh STABLE fingerprint from the resolved
-      // variables (and revision + env + workspace + assignee). The fingerprint
-      // does NOT include the per-fire occurrenceId — that lives separately on
-      // `routine_runs.dispatch_occurrence_id` for debuggability. Variable-based
-      // discrimination in findLiveExecutionIssue requires the fingerprint to be
-      // stable across fires of the same (routine, variables) tuple; per-fire
-      // uniqueness for the partial unique index is preserved by the
-      // `routines.id` row lock that serializes dispatch transactions for the
-      // same routine.
-      dispatchFingerprint = createRoutineDispatchFingerprint({
+      // First-time fire: compute both the per-fire fingerprint (mixed with
+      // the fresh occurrenceId; written to `routine_runs.dispatch_fingerprint`
+      // and to `issues.origin_fingerprint`) and the STABLE fingerprint (same
+      // inputs without the occurrenceId; passed to `findLiveExecutionIssue`
+      // for variable-based discrimination). Per-fire uniqueness lets two cron
+      // ticks of the same routine revision write distinct `dispatch_fingerprint`
+      // values, which the e2e tests assert on `routine_runs.dispatch_fingerprint`;
+      // stable-fingerprint comparison in the lookup restores variable-based
+      // discrimination (e.g. `branch: feature/a` vs `branch: feature/b`).
+      const fingerprintInputs = {
         payload: triggerPayload,
         projectId,
         projectWorkspaceId,
@@ -1895,7 +1920,12 @@ export function routineService(
         executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
         title,
         description,
+      };
+      dispatchFingerprint = createRoutineDispatchFingerprint({
+        ...fingerprintInputs,
+        dispatchOccurrenceId,
       });
+      const dispatchStableFingerprint = createRoutineDispatchStableFingerprint(fingerprintInputs);
 
       const triggeredAt = new Date();
       const manualRunnerUserId = input.source === "manual" ? input.actor?.userId ?? null : null;
@@ -1945,7 +1975,7 @@ export function routineService(
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
-        const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+        const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchStableFingerprint, {
           kind: issueOriginKind,
           id: issueOriginId,
         });
@@ -1994,7 +2024,7 @@ export function routineService(
             originKind: issueOriginKind,
             originId: issueOriginId,
             originRunId: createdRun.id,
-            originFingerprint: dispatchFingerprint,
+            originFingerprint: dispatchStableFingerprint,
             billingCode: issueBillingCode,
             executionWorkspaceId: input.executionWorkspaceId ?? null,
             executionWorkspacePreference: input.executionWorkspacePreference ?? null,
@@ -2012,7 +2042,7 @@ export function routineService(
             throw error;
           }
 
-          const existingIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+          const existingIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchStableFingerprint, {
             kind: issueOriginKind,
             id: issueOriginId,
           });
