@@ -35,7 +35,6 @@ UPDATE "issues" AS i
    SET "execution_run_id" = NULL,
        "execution_agent_name_key" = NULL,
        "execution_locked_at" = NULL,
-       "updated_at" = now(),
        "status" = 'cancelled',
        "cancelled_at" = now()
   FROM "heartbeat_runs" AS hr
@@ -68,7 +67,6 @@ UPDATE "issues" AS i
    SET "execution_run_id" = NULL,
        "execution_agent_name_key" = NULL,
        "execution_locked_at" = NULL,
-       "updated_at" = now(),
        "status" = 'cancelled',
        "cancelled_at" = now()
  WHERE i."origin_kind" = 'routine_execution'
