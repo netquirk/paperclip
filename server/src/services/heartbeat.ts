@@ -16843,7 +16843,7 @@ export function heartbeatService(
                   .update(heartbeatRuns)
                   .set({
                     status: "running",
-                    runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+                    runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
                     responsibleUserId,
                     startedAt: lockedRun.startedAt ?? claimedAt,
                     updatedAt: claimedAt,
@@ -16940,7 +16940,7 @@ export function heartbeatService(
                 .update(heartbeatRuns)
                 .set({
                   status: "running",
-                  runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+                  runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
                   responsibleUserId,
                   startedAt: lockedRun.startedAt ?? claimedAt,
                   contextSnapshot: withQueuedCommentIdsInRunContext(
@@ -17007,7 +17007,7 @@ export function heartbeatService(
             .update(heartbeatRuns)
             .set({
               status: "running",
-              runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+              runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
               responsibleUserId,
               startedAt: run.startedAt ?? claimedAt,
               updatedAt: claimedAt,
@@ -22548,10 +22548,12 @@ export function heartbeatService(
               runtimeModeResolvedAt: run.runtimeModeResolvedAt ?? new Date(),
               // Preserve server-owned admission and dispatch evidence on this
               // row; never copy another run's execution profile.
-              runnerProfileJson: sql`jsonb_strip_nulls(jsonb_build_object(
-                ${CHAT_CONTROL_RECOVERY_ADMISSION_KEY}::text, ${heartbeatRuns.runnerProfileJson}->${CHAT_CONTROL_RECOVERY_ADMISSION_KEY},
-                'adapterDispatch', ${heartbeatRuns.runnerProfileJson}->'adapterDispatch'
-              )) || ${JSON.stringify(providerTraceRequested ? { providerTrace: { mode: "raw", traceId: providerTraceCapture?.metadata.id ?? null, maxBytes: PROVIDER_TRACE_MAX_BYTES } } : {})}::jsonb`,
+              runnerProfileJson: sql`(case when ${heartbeatRuns.runnerProfileJson} ? ${CHAT_CONTROL_RECOVERY_ADMISSION_KEY}
+                then jsonb_build_object(${CHAT_CONTROL_RECOVERY_ADMISSION_KEY}::text, ${heartbeatRuns.runnerProfileJson}->${CHAT_CONTROL_RECOVERY_ADMISSION_KEY})
+                else '{}'::jsonb end)
+              || (case when ${heartbeatRuns.runnerProfileJson} ? 'adapterDispatch'
+                then jsonb_build_object('adapterDispatch', ${heartbeatRuns.runnerProfileJson}->'adapterDispatch')
+                else '{}'::jsonb end) || ${JSON.stringify(providerTraceRequested ? { providerTrace: { mode: "raw", traceId: providerTraceCapture?.metadata.id ?? null, maxBytes: PROVIDER_TRACE_MAX_BYTES } } : {})}::jsonb`,
               updatedAt: new Date(),
             })
             .where(eq(heartbeatRuns.id, run.id));
