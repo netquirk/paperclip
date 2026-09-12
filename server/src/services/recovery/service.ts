@@ -69,6 +69,10 @@ import {
   type ActivityPublication,
 } from "../activity-log.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import {
+  reconcileStaleRunSidecars,
+  reconcileTerminalRunSidecars,
+} from "../heartbeat-run-sidecar-reconciler.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { budgetService } from "../budgets.js";
 import { unadmittedChatWakeupCondition } from "../durable-chat-wakeup.js";
@@ -5748,7 +5752,21 @@ export function recoveryService(
         runReferencedByActiveIssue: runIdsReferencedByActiveIssue.has(row.id),
       });
       runStatusById.set(row.id, outcome.status);
-      if (outcome.terminalized) result.terminalizedRunIds.push(row.id);
+      if (outcome.terminalized) {
+        result.terminalizedRunIds.push(row.id);
+        // NET-6944: terminalizeOrphanedRunningRun only writes
+        // heartbeat_runs.status. The run's wake and the agent status are
+        // repaired here so the lock-clear and the sidecar reconciliation move
+        // together. The primitive is idempotent so a later sweep is safe.
+        try {
+          await reconcileTerminalRunSidecars(db, row.id);
+        } catch (reconcileErr) {
+          logger.warn(
+            { err: reconcileErr, runId: row.id },
+            "failed to reconcile terminal run sidecars during sweepStaleIssueLocks",
+          );
+        }
+      }
     }
 
     const isCleanable = (runId: string | null) => {
@@ -5835,6 +5853,11 @@ export function recoveryService(
     reconcileStrandedAssignedIssues,
     sweepStaleIssueLocks,
     reconcileResolvedDependencyWakeBackstop,
+    // NET-6944: extend periodic/startup reconciliation to wake+agent
+    // sidecars so terminal runs with stale wakes and stuck-running agents
+    // are repaired even when their issue lock was already cleared.
+    reconcileStaleRunSidecars: (input?: { limit?: number; companyId?: string }) =>
+      reconcileStaleRunSidecars(db, input),
     readRecoveryTimerIntervalMs,
   };
 }

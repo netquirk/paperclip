@@ -1548,6 +1548,31 @@ async function startServerWithDatabaseTeardown(
         if (swept.cleared > 0) {
           logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
         }
+
+        // NET-6944: extend startup reconciliation to repair terminal-run ↔
+        // live-wake mismatches and agents stuck `running` with no live run.
+        // The primitive is bounded and idempotent so it is safe to run
+        // alongside the existing sweep without re-doing work.
+        try {
+          const sidecarSweep = await heartbeat?.reconcileStaleRunSidecars?.({
+            limit: 1000,
+          });
+          if (
+            sidecarSweep &&
+            (sidecarSweep.wakeRepaired > 0 ||
+              sidecarSweep.agentRepaired > 0)
+          ) {
+            logger.warn(
+              { ...sidecarSweep },
+              "startup terminal-sidecar reconciler repaired stale wakes / stuck agents",
+            );
+          }
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup terminal-sidecar reconciler failed",
+          );
+        }
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
         throw err;
@@ -1785,6 +1810,31 @@ async function startServerWithDatabaseTeardown(
               const swept = await heartbeat.sweepStaleIssueLocks();
               if (swept.cleared > 0) {
                 logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+              }
+            })
+            .then(async () => {
+              // NET-6944: extend the periodic reconciliation to wake+agent
+              // sidecars. Bounded by the limit arg so a single tick cannot
+              // monopolize the recovery budget.
+              try {
+                const sidecarSweep = await heartbeat?.reconcileStaleRunSidecars?.(
+                  { limit: 200 },
+                );
+                if (
+                  sidecarSweep &&
+                  (sidecarSweep.wakeRepaired > 0 ||
+                    sidecarSweep.agentRepaired > 0)
+                ) {
+                  logger.warn(
+                    { ...sidecarSweep },
+                    "periodic terminal-sidecar reconciler repaired stale wakes / stuck agents",
+                  );
+                }
+              } catch (err) {
+                logger.error(
+                  { err },
+                  "periodic terminal-sidecar reconciler failed",
+                );
               }
             })
             .catch((err) => {

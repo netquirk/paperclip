@@ -516,6 +516,10 @@ import {
 } from "./agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled } from "./heartbeat-policy.js";
 import {
+  reconcileStaleRunSidecars as reconcileStaleRunSidecarsImpl,
+  reconcileTerminalRunSidecars,
+} from "./heartbeat-run-sidecar-reconciler.js";
+import {
   isLowTrustQuarantined,
   redactQuarantinedBodyForHigherTrust,
   sanitizeQuarantinedCommentForHigherTrust,
@@ -18431,6 +18435,18 @@ export function heartbeatService(
       await finalizeAgentStatus(run.agentId, "failed", baseMessage, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       });
+      // NET-6944: defense-in-depth reconciliation. setWakeupStatus above may
+      // have failed mid-write, and finalizeAgentStatus can be skipped or short-
+      // circuited (e.g. paused agent). The reconciler is idempotent and
+      // self-guarded so a successful prior terminalization is a no-op.
+      try {
+        await reconcileTerminalRunSidecars(db, finalizedRun.id);
+      } catch (reconcileErr) {
+        logger.warn(
+          { err: reconcileErr, runId: finalizedRun.id },
+          "failed to reconcile terminal run sidecars during orphan reaping",
+        );
+      }
       await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
       reaped.push(run.id);
@@ -18663,6 +18679,16 @@ export function heartbeatService(
 
   async function sweepStaleIssueLocks() {
     return recovery.sweepStaleIssueLocks();
+  }
+
+  // NET-6944: periodic reconciliation for terminal-run ↔ live-wake
+  // mismatches and agents stuck `running` with no live run. Bounded and
+  // idempotent; safe to invoke on a timer and at startup.
+  async function reconcileStaleRunSidecars(input?: {
+    limit?: number;
+    companyId?: string;
+  }) {
+    return reconcileStaleRunSidecarsImpl(db, input);
   }
 
   function issueIdFromRunContext(contextSnapshot: unknown) {
@@ -19056,7 +19082,29 @@ export function heartbeatService(
     if (run.status !== "queued" && run.status !== "running") return;
 
     if (run.status === "queued") {
-      const claimed = await claimQueuedRun(run);
+      // The claim path is the structural wedge identified by NET-6942 /
+      // NET-6788: claimQueuedRun flips `heartbeat_runs.status` to "running"
+      // and the wake to "claimed" before any cleanup boundary exists. If the
+      // subsequent `issues.executionRunId` write raises the
+      // `issues_open_routine_execution_uq` unique-index exception (or any
+      // other throw), the run is left `running` and the wake is left
+      // `claimed` with no outer teardown to repair them. Wrap the claim so
+      // every partial claim reaches `reconcileTerminalRunSidecars` before the
+      // exception escapes this scope.
+      let claimed: typeof run | null = null;
+      try {
+        claimed = await claimQueuedRun(run);
+      } catch (claimErr) {
+        try {
+          await reconcileTerminalRunSidecars(db, run.id);
+        } catch (reconcileErr) {
+          logger.error(
+            { err: reconcileErr, runId: run.id },
+            "failed to reconcile terminal run sidecars after claim throw",
+          );
+        }
+        throw claimErr;
+      }
       if (!claimed) {
         // claimQueuedRun can also leave the run queued when dependencies are unresolved.
         return;
@@ -24668,6 +24716,29 @@ export function heartbeatService(
           },
         );
       }
+
+      // NET-6944: the run sidecars (`agent_wakeup_requests`,
+      // `agents.status`) must move with the run. The terminal run is now
+      // authoritative; reconcile the sidecars idempotently so a missing or
+      // crashing inner-catch cannot leave the wake `claimed` or the agent
+      // wedged `running`. Defense in depth for any path that already wrote
+      // some terminal fields — the primitive is a no-op when the sidecars
+      // are already terminal.
+      if (
+        latestRun &&
+        isHeartbeatRunTerminalStatus(latestRun.status) &&
+        !nativeSessionResumeScheduled &&
+        !nativeWorkspaceFinalizeScheduled
+      ) {
+        try {
+          await reconcileTerminalRunSidecars(db, latestRun.id);
+        } catch (reconcileErr) {
+          logger.error(
+            { err: reconcileErr, runId: latestRun.id },
+            "failed to reconcile terminal run sidecars during heartbeat teardown",
+          );
+        }
+      }
       // Warm retention is earned only by a fully successful turn. A failed,
       // cancelled, or timed-out run stops the reusable sandbox so the next
       // acquisition must revalidate and explicitly resume it.
@@ -27996,6 +28067,8 @@ export function heartbeatService(
     resumeRemoteStopComments,
 
     sweepStaleIssueLocks,
+
+    reconcileStaleRunSidecars,
 
     reconcileResolvedDependencyWakes,
 
