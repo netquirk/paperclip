@@ -69,6 +69,34 @@ export interface RoutineVariable {
 
 export type RoutineEnvConfig = Record<string, EnvBinding>;
 
+/**
+ * Issue creation template a routine can declare. When the routine fires, the
+ * framework renders each templated field against the resolved trigger
+ * variables and applies the result to the auto-created execution issue.
+ *
+ * - `title` / `description`: same `{{var}}` interpolation as the routine's
+ *   own `title` / `description`. When the routine declares an issue template,
+ *   these values REPLACE the routine-level fallbacks.
+ * - `labels`: list of label-name templates. The framework resolves each
+ *   rendered name against the company-level labels, creating any missing
+ *   company label. Rendered labels exceeding the platform's 48-char name cap
+ *   fall back to `monitoring-intake:<sha256[:8]>` so legacy short-hash
+ *   routines still emit a valid label.
+ * - `priority`: either a literal IssuePriority OR a map keyed by
+ *   `payload.severity` (the monitoring-intake convention) so alert-driven
+ *   routines can pivot priority by incoming severity.
+ */
+export interface RoutineIssueTemplate {
+  title?: string | null;
+  description?: string | null;
+  labels?: string[] | null;
+  priority?: RoutineIssueTemplatePriority | null;
+}
+
+export type RoutineIssueTemplatePriority =
+  | IssuePriority
+  | Partial<Record<string, IssuePriority>>;
+
 export interface Routine {
   id: string;
   companyId: string;
@@ -89,6 +117,7 @@ export interface Routine {
   originId?: string | null;
   variables: RoutineVariable[];
   env?: RoutineEnvConfig | null;
+  issueTemplate?: RoutineIssueTemplate | null;
   latestRevisionId: string | null;
   latestRevisionNumber: number;
   createdByAgentId: string | null;
@@ -134,6 +163,7 @@ export interface RoutineRevisionSnapshotRoutineV1 {
   originId?: string | null;
   variables: RoutineVariable[];
   env: RoutineEnvConfig | null;
+  issueTemplate?: RoutineIssueTemplate | null;
   responsibleUserId: string | null;
 }
 

@@ -861,6 +861,8 @@ export type {
   RoutineDescriptionDocument,
   RoutineVariable,
   RoutineVariableDefaultValue,
+  RoutineIssueTemplate,
+  RoutineIssueTemplatePriority,
   RoutineRevisionSnapshotRoutineV1,
   RoutineRevisionSnapshotTriggerV1,
   RoutineRevisionSnapshotV1,

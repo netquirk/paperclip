@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   ISSUE_PRIORITIES,
+  ISSUE_SURFACE_VISIBILITIES,
   ROUTINE_ACTIVITY_GATE_POLICIES,
   ROUTINE_ACTIVITY_GATE_SCOPES,
   ROUTINE_CATCH_UP_POLICIES,
@@ -19,6 +20,35 @@ import { isValidRoutineDateString } from "../routine-variables.js";
 import { objectWithoutDefaults } from "./partial.js";
 
 const routineVariableValueSchema = z.union([z.string(), z.number().finite(), z.boolean()]);
+
+/**
+ * Routine-declared issue template. The framework renders each field against
+ * the resolved routine variables and applies the result to the auto-created
+ * execution issue when the routine fires.
+ *
+ * `priority` may be either a literal IssuePriority or a map keyed by
+ * `payload.severity` (monitoring-intake convention) so alert-driven routines
+ * can pivot priority by incoming severity.
+ */
+export const routineIssueTemplateSchema = z
+  .object({
+    title: z.string().trim().min(1).max(200).optional().nullable(),
+    description: z.string().max(50_000).optional().nullable(),
+    labels: z.array(z.string().trim().min(1).max(48)).max(20).optional().nullable(),
+    priority: z
+      .union([
+        z.enum(ISSUE_PRIORITIES),
+        z.record(z.string().trim().min(1).max(64), z.enum(ISSUE_PRIORITIES)),
+      ])
+      .optional()
+      .nullable(),
+    surfaceVisibility: z.enum(ISSUE_SURFACE_VISIBILITIES).optional().nullable(),
+    originId: z.string().trim().min(1).max(255).optional().nullable(),
+    billingCode: z.string().trim().min(1).max(200).optional().nullable(),
+  })
+  .strict();
+
+export type RoutineIssueTemplateInput = z.infer<typeof routineIssueTemplateSchema>;
 
 export const routineVariableSchema = z.object({
   name: z.string().trim().regex(/^[A-Za-z][A-Za-z0-9_]*$/),
@@ -78,6 +108,7 @@ export const createRoutineSchema = z.object({
   activityGateScope: z.enum(ROUTINE_ACTIVITY_GATE_SCOPES).optional(),
   variables: z.array(routineVariableSchema).optional().default([]),
   env: envConfigSchema.optional().nullable(),
+  issueTemplate: routineIssueTemplateSchema.optional().nullable(),
 });
 
 export type CreateRoutine = z.infer<typeof createRoutineSchema>;
@@ -105,6 +136,7 @@ export const routineRevisionSnapshotRoutineV1Schema = z.object({
   activityGateScope: z.enum(ROUTINE_ACTIVITY_GATE_SCOPES).default("company"),
   variables: z.array(routineVariableSchema),
   env: envConfigSchema.nullable().default(null),
+  issueTemplate: routineIssueTemplateSchema.nullable().default(null),
   responsibleUserId: z.string().nullable().default(null),
 }).strict();
 

@@ -17,6 +17,7 @@ import {
   heartbeatRuns,
   issueInboxArchives,
   issues,
+  labels,
   pluginManagedResources,
   plugins,
   projects,
@@ -32,6 +33,7 @@ import type {
   Routine,
   RoutineDetail,
   RoutineDescriptionDocument,
+  RoutineIssueTemplate,
   RoutineListItem,
   RoutineManagedByPlugin,
   RoutineRevision,
@@ -545,6 +547,181 @@ function readManagedRoutineIssueTemplate(defaultsJson: Record<string, unknown> |
   };
 }
 
+const ISSUE_LABEL_MAX_NAME_LENGTH = 48;
+
+/**
+ * Hash a label string down to the 8-char prefix `monitoring-intake:<sha>` uses
+ * for alert-identity labels whose rendered name would exceed the platform's
+ * 48-char label-name cap. Stable per input.
+ */
+function shortHashLabelSuffix(input: string): string {
+  return crypto.createHash("sha256").update(input).digest("hex").slice(0, 8);
+}
+
+/**
+ * Deterministic 6-digit hex color picked from the sha256 of `seed`. The
+ * routine-side label creator only fires when the company has no label with
+ * that name, so the chosen color becomes stable the first time a label is
+ * auto-created for a routine. Avoids blank/missing color in the UI.
+ */
+function deterministicLabelColor(seed: string): string {
+  const digest = crypto.createHash("sha256").update(seed).digest("hex").slice(0, 6);
+  return `#${digest}`;
+}
+
+function normalizeRoutineIssueTemplate(raw: unknown): RoutineIssueTemplate | null {
+  if (!isPlainRecord(raw)) return null;
+  const result: RoutineIssueTemplate = {};
+  if (typeof raw.title === "string" && raw.title.trim()) {
+    result.title = raw.title.trim();
+  }
+  if (typeof raw.description === "string") {
+    result.description = raw.description;
+  } else if (raw.description === null) {
+    result.description = null;
+  }
+  if (Array.isArray(raw.labels)) {
+    const labels = raw.labels
+      .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+      .map((entry) => entry.trim());
+    if (labels.length > 0) result.labels = labels;
+  }
+  if (typeof raw.priority === "string" && isIssuePriorityValue(raw.priority)) {
+    result.priority = raw.priority;
+  } else if (isPlainRecord(raw.priority)) {
+    const map: Record<string, ReturnType<typeof asIssuePriority>> = {};
+    for (const [key, value] of Object.entries(raw.priority)) {
+      if (typeof value === "string" && isIssuePriorityValue(value)) {
+        map[key] = value;
+      }
+    }
+    if (Object.keys(map).length > 0) result.priority = map;
+  }
+  return Object.keys(result).length > 0 ? result : null;
+}
+
+function isIssuePriorityValue(value: unknown): value is "critical" | "high" | "medium" | "low" {
+  return value === "critical" || value === "high" || value === "medium" || value === "low";
+}
+
+function asIssuePriority(value: unknown) {
+  return isIssuePriorityValue(value) ? value : "medium";
+}
+
+/**
+ * Resolve a routine's effective issue template at fire time. Plugin-managed
+ * routines still take their `surfaceVisibility` / `originId` / `billingCode`
+ * from `defaultsJson`, but `title` / `description` / `labels` / `priority`
+ * come from the routine row's own `issueTemplate` so non-plugin routines
+ * can carry rich templates too.
+ */
+function effectiveRoutineIssueTemplate(
+  routine: typeof routines.$inferSelect,
+  managedIssueTemplate: ReturnType<typeof readManagedRoutineIssueTemplate>,
+): RoutineIssueTemplate | null {
+  const normalized = normalizeRoutineIssueTemplate((routine as { issueTemplate?: unknown }).issueTemplate);
+  if (!normalized) return null;
+  // Plugin defaults only fill the surface-slot fields; they never override a
+  // routine-declared title/description/labels/priority.
+  if (managedIssueTemplate?.surfaceVisibility && !normalized.title && !normalized.description) {
+    // (No-op: surfaceVisibility/originId/billingCode are folded into the
+    // issue creation path separately, so we keep the template object
+    // unmodified here.)
+  }
+  return normalized;
+}
+
+function resolveIssueTemplatePriority(
+  priority: RoutineIssueTemplate["priority"] | undefined,
+  payload: Record<string, unknown> | null | undefined,
+  fallback: RoutineIssueTemplate["priority"] | string,
+): string | undefined {
+  if (!priority) return typeof fallback === "string" ? fallback : undefined;
+  if (typeof priority === "string") return priority;
+  const severity = typeof payload?.severity === "string" ? payload.severity : undefined;
+  if (severity && priority[severity]) return priority[severity];
+  const fallbackKey = typeof payload?.event_type === "string" ? payload.event_type : undefined;
+  if (fallbackKey && priority[fallbackKey]) return priority[fallbackKey];
+  return typeof fallback === "string" ? fallback : undefined;
+}
+
+/**
+ * Resolve a list of rendered label names to label IDs. Creates any missing
+ * company-level label so a brand-new routine never fails dispatch on a label
+ * it just declared. Rendered names exceeding the 48-char cap fall back to the
+ * `monitoring-intake:<sha[:8]>` convention so legacy short-hash labels stay
+ * valid.
+ */
+async function resolveRoutineIssueLabelIds(
+  txDb: Db,
+  input: {
+    companyId: string;
+    renderedLabels: string[];
+  },
+): Promise<{ labelIds: string[]; createdNames: string[]; skippedNames: string[] }> {
+  const dedupedNames = [...new Set(input.renderedLabels.map((name) => name.trim()).filter(Boolean))];
+  if (dedupedNames.length === 0) {
+    return { labelIds: [], createdNames: [], skippedNames: [] };
+  }
+  const labelIds: string[] = [];
+  const createdNames: string[] = [];
+  const skippedNames: string[] = [];
+
+  for (const rawName of dedupedNames) {
+    let name = rawName;
+    if (name.length > ISSUE_LABEL_MAX_NAME_LENGTH) {
+      // mirror the manual POST path: the monitoring-intake routine intentionally
+      // passes long alert-identity labels and relies on the SHA-256 short hash
+      // fallback to satisfy the 48-char cap.
+      const prefix = name.split(":", 1)[0] ?? "";
+      const safePrefix = prefix.length > 0 && prefix.length <= ISSUE_LABEL_MAX_NAME_LENGTH - 9
+        ? `${prefix}:`
+        : "";
+      const fallback = `${safePrefix}${shortHashLabelSuffix(name)}`;
+      skippedNames.push(name);
+      name = fallback;
+    }
+    const existing = await txDb
+      .select({ id: labels.id })
+      .from(labels)
+      .where(and(eq(labels.companyId, input.companyId), eq(labels.name, name)))
+      .limit(1)
+      .then((rows: Array<{ id: string }>) => rows[0] ?? null);
+    if (existing) {
+      labelIds.push(existing.id);
+      continue;
+    }
+    try {
+      const [created] = await txDb
+        .insert(labels)
+        .values({
+          companyId: input.companyId,
+          name,
+          color: deterministicLabelColor(name),
+        })
+        .returning({ id: labels.id });
+      if (created) {
+        labelIds.push(created.id);
+        createdNames.push(name);
+      }
+    } catch (error) {
+      // Race with a concurrent creator or the unique index — re-read.
+      const reread = await txDb
+        .select({ id: labels.id })
+        .from(labels)
+        .where(and(eq(labels.companyId, input.companyId), eq(labels.name, name)))
+        .limit(1)
+        .then((rows: Array<{ id: string }>) => rows[0] ?? null);
+      if (reread) {
+        labelIds.push(reread.id);
+      } else {
+        throw error;
+      }
+    }
+  }
+  return { labelIds, createdNames, skippedNames };
+}
+
 function routineUsesWorkspaceBranch(routine: typeof routines.$inferSelect) {
   return (routine.variables ?? []).some((variable) => variable.name === WORKSPACE_BRANCH_ROUTINE_VARIABLE)
     || extractRoutineVariableNames([routine.title, routine.description]).includes(WORKSPACE_BRANCH_ROUTINE_VARIABLE);
@@ -568,6 +745,7 @@ function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSna
     activityGateScope: routine.activityGateScope as RoutineRevisionSnapshotV1["routine"]["activityGateScope"],
     variables: routine.variables ?? [],
     env: routine.env ?? null,
+    issueTemplate: routine.issueTemplate ?? null,
     responsibleUserId: routine.responsibleUserId ?? null,
   };
 }
@@ -1747,18 +1925,43 @@ export function routineService(
       automaticVariables,
     });
     const allVariables = { ...getBuiltinRoutineVariableValues(), ...automaticVariables, ...resolvedVariables };
-    const title = interpolateRoutineTemplate(input.routine.title, allVariables) ?? input.routine.title;
-    const baseDescription = interpolateRoutineTemplate(input.routine.description, allVariables);
-    const description = [baseDescription, input.descriptionAppendix]
-      .filter((part): part is string => Boolean(part && part.trim()))
-      .join("\n\n");
     const triggerPayload = mergeRoutineRunPayload(input.payload, { ...automaticVariables, ...resolvedVariables });
     const managedRoutineBinding = await getManagedRoutineBinding(input.routine);
     const managedIssueTemplate = readManagedRoutineIssueTemplate(managedRoutineBinding?.defaultsJson);
+    const routineIssueTemplate = effectiveRoutineIssueTemplate(input.routine, managedIssueTemplate);
+    const renderedTemplateTitle = routineIssueTemplate?.title
+      ? interpolateRoutineTemplate(routineIssueTemplate.title, allVariables) ?? input.routine.title
+      : null;
+    const renderedTemplateDescription = routineIssueTemplate?.title
+      ? interpolateRoutineTemplate(routineIssueTemplate.description ?? null, allVariables)
+      : null;
+    const title = renderedTemplateTitle
+      ?? interpolateRoutineTemplate(input.routine.title, allVariables)
+      ?? input.routine.title;
+    const baseDescription = renderedTemplateDescription
+      ?? interpolateRoutineTemplate(input.routine.description, allVariables);
+    const description = [baseDescription, input.descriptionAppendix]
+      .filter((part): part is string => Boolean(part && part.trim()))
+      .join("\n\n");
+    const renderedLabelNames: string[] = (routineIssueTemplate?.labels ?? [])
+      .map((label: string) => interpolateRoutineTemplate(label, allVariables) ?? "")
+      .map((label: string) => label.trim())
+      .filter((label): label is string => Boolean(label));
+    const labelResolution = await resolveRoutineIssueLabelIds(db, {
+      companyId: input.routine.companyId,
+      renderedLabels: renderedLabelNames,
+    });
+    const issuePriority = resolveIssueTemplatePriority(
+      routineIssueTemplate?.priority,
+      triggerPayload,
+      input.routine.priority,
+    );
     const issueOriginKind = managedIssueTemplate?.surfaceVisibility === "plugin_operation" && managedRoutineBinding
       ? pluginOperationIssueOriginKind(managedRoutineBinding.pluginKey)
       : "routine_execution";
-    const issueOriginId = managedIssueTemplate?.originId ?? input.routine.id;
+    const issueOriginId = managedIssueTemplate?.originId
+      ?? (routineIssueTemplate?.title ? input.routine.id : managedIssueTemplate?.originId)
+      ?? input.routine.id;
     const issueBillingCode = managedIssueTemplate?.billingCode ?? null;
     const dispatchFingerprint = createRoutineDispatchFingerprint({
       payload: triggerPayload,
@@ -1890,7 +2093,7 @@ export function routineService(
             title,
             description,
             status: "todo",
-            priority: input.routine.priority,
+            priority: (issuePriority ?? input.routine.priority) as typeof issues.$inferInsert.priority,
             assigneeAgentId,
             createdByAgentId: input.source === "manual" ? input.actor?.agentId ?? null : null,
             createdByUserId: manualRunnerUserId,
@@ -1901,6 +2104,7 @@ export function routineService(
             originRunId: createdRun.id,
             originFingerprint: dispatchFingerprint,
             billingCode: issueBillingCode,
+            labelIds: labelResolution.labelIds,
             executionWorkspaceId: input.executionWorkspaceId ?? null,
             executionWorkspacePreference: input.executionWorkspacePreference ?? null,
             executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
@@ -2214,6 +2418,7 @@ export function routineService(
             activityGateScope: input.activityGateScope ?? "company",
             variables,
             env,
+            issueTemplate: input.issueTemplate ?? null,
             responsibleUserId,
             createdByAgentId: actor.agentId ?? null,
             createdByUserId: actor.userId ?? null,
@@ -2329,6 +2534,7 @@ export function routineService(
           activityGateScope: patch.activityGateScope ?? locked.activityGateScope,
           variables: nextVariables,
           env: nextEnv,
+          issueTemplate: patch.issueTemplate === undefined ? locked.issueTemplate ?? null : patch.issueTemplate ?? null,
           responsibleUserId: locked.responsibleUserId ?? responsibleUserId,
           updatedByAgentId: actor.agentId ?? null,
           updatedByUserId: actor.userId ?? null,
@@ -2394,6 +2600,7 @@ export function routineService(
             activityGateScope: candidate.activityGateScope,
             variables: candidate.variables,
             env: candidate.env,
+            issueTemplate: candidate.issueTemplate,
             responsibleUserId: candidate.responsibleUserId,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
