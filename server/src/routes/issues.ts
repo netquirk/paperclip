@@ -3749,7 +3749,7 @@ export function issueRoutes(
   async function assertCrossIssueInfluenceWithinRunCap(
     req: Request,
     res: Response,
-    issue: { id: string; identifier?: string | null; companyId: string },
+    issue: { id: string; identifier?: string | null; companyId: string; checkoutRunId?: string | null },
     kind: CrossIssueInfluenceKind,
   ) {
     if (req.actor.type !== "agent") return true;
@@ -3765,6 +3765,7 @@ export function issueRoutes(
       responsibleUserId: req.actor.onBehalfOfUserId ?? null,
       targetIssueId: issue.id,
       targetIssueIdentifier: issue.identifier ?? null,
+      targetIssueCheckoutRunId: issue.checkoutRunId ?? null,
       kind,
     });
     if (!decision || decision.allowed) return true;
@@ -6215,11 +6216,15 @@ export function issueRoutes(
   async function assertDeliverableMutationAllowedByRunContext(
     req: Request,
     res: Response,
-    issue: { id: string; companyId: string },
+    issue: { id: string; companyId: string; checkoutRunId?: string | null },
   ) {
     const run = await loadActorRunContext(req, issue.companyId);
     if (!run) return true;
     if (!isStatusOnlyRecoveryContext(run.contextSnapshot)) return true;
+    // Actor-runId-aware MUTE bypass (NET-7154 / plan §6): when the actor's run
+    // IS the issue's checked-out run, the actor is the legitimate active owner.
+    // MUTE is meant to prevent cross-run contention, not block the active run.
+    if (issue.checkoutRunId && run.id === issue.checkoutRunId) return true;
 
     res.status(403).json({
       error:
@@ -6237,11 +6242,12 @@ export function issueRoutes(
   async function assertApprovalMutationAllowedByRunContext(
     req: Request,
     res: Response,
-    issue: { id: string; companyId: string },
+    issue: { id: string; companyId: string; checkoutRunId?: string | null },
   ) {
     const run = await loadActorRunContext(req, issue.companyId);
     if (!run) return true;
     if (!isStatusOnlyRecoveryContext(run.contextSnapshot)) return true;
+    if (issue.checkoutRunId && run.id === issue.checkoutRunId) return true;
 
     res.status(403).json({
       error: "Status-only recovery runs cannot create or modify approvals",

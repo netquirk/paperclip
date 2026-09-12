@@ -1,6 +1,6 @@
 import { Router, type Request } from "express";
-import { eq } from "drizzle-orm";
-import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { and, eq, inArray } from "drizzle-orm";
+import { heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import {
   addApprovalCommentSchema,
   createApprovalSchema,
@@ -189,6 +189,12 @@ export function approvalRoutes(
       .then((rows) => rows[0] ?? null);
     if (!run || run.companyId !== companyId || run.agentId !== req.actor.agentId) return true;
     if (!isStatusOnlyRecoveryContext(run.contextSnapshot)) return true;
+    // Actor-runId-aware MUTE bypass (NET-7154): when the actor's run is the
+    // checked-out run on at least one of the issues linked to the approval,
+    // treat it as the active owner. MUTE is meant to prevent cross-run
+    // contention, not block the active run. Cached to a single query for the
+    // approval's issue ids — the calling route passes linked issue ids.
+    if (await actorOwnsAnyApprovalIssue(run, req)) return true;
 
     res.status(403).json({
       error: "Status-only recovery runs cannot create or modify approvals",
@@ -200,6 +206,35 @@ export function approvalRoutes(
       },
     });
     return false;
+  }
+
+  async function actorOwnsAnyApprovalIssue(
+    run: { id: string },
+    req: Request,
+  ): Promise<boolean> {
+    const ids = extractApprovalIssueIdsFromRequest(req);
+    if (ids.length === 0) return false;
+    const rows = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          inArray(issues.id, ids),
+          eq(issues.checkoutRunId, run.id),
+        ),
+      )
+      .then((rows) => rows);
+    return rows.length > 0;
+  }
+
+  function extractApprovalIssueIdsFromRequest(req: Request): string[] {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const candidates: unknown[] = [];
+    if (Array.isArray(body.issueIds)) candidates.push(...body.issueIds);
+    if (Array.isArray(body.issues)) candidates.push(...body.issues);
+    if (typeof body.issueId === "string") candidates.push(body.issueId);
+    return candidates
+      .filter((value): value is string => typeof value === "string" && value.length > 0);
   }
 
   router.get("/companies/:companyId/approvals", async (req, res) => {

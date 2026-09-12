@@ -76,6 +76,8 @@ export async function observeCrossIssueInfluence(
     responsibleUserId?: string | null;
     targetIssueId: string;
     targetIssueIdentifier?: string | null;
+    /** Active checkout run on the target issue; used for actorRunId-aware MUTE bypass (NET-7154). */
+    targetIssueCheckoutRunId?: string | null;
     kind: CrossIssueInfluenceKind;
     now?: Date;
   },
@@ -110,7 +112,21 @@ export async function observeCrossIssueInfluence(
     }
 
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+    if (!sourceIssueId) {
+      // NET-7154: actorRunId-aware MUTE bypass. An unscoped timer wake has no
+      // sourceIssueId in its contextSnapshot (see heartbeat.ts:28469-28481), so
+      // the source-issue self-target test cannot match. When the actor's run is
+      // the active checkout run on the target issue, the agent is the
+      // legitimate owner of the target — MUTE is meant to prevent cross-run
+      // contention, not block the active run.
+      if (
+        input.targetIssueCheckoutRunId &&
+        run.id === input.targetIssueCheckoutRunId
+      ) {
+        return null;
+      }
+      throw crossIssueInfluenceRunContextError();
+    }
     if (
       sourceIssueId === input.targetIssueId ||
       (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())

@@ -213,4 +213,40 @@ describe("cross-issue influence limit rollout", () => {
     });
     expect(fake.inserted).toEqual([]);
   });
+
+  it("bypasses MUTE for the active run on the target issue (NET-7154)", async () => {
+    const fake = counterDb(0, { contextSnapshot: {} });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      // The actor's run IS the active checkout run on the target issue.
+      targetIssueCheckoutRunId: "11111111-1111-4111-8111-111111111111",
+      kind: "update",
+    })).resolves.toBeNull();
+    // MUTE bypass is a same-issue short-circuit (matches the existing
+    // sourceIssueId === targetIssueId path at lines 114-119): no row is
+    // recorded in the cross-issue activity log.
+    expect(fake.inserted).toEqual([]);
+  });
+
+  it("still fails closed when no source issue and the run is not the active checkout run (NET-7154)", async () => {
+    const fake = counterDb(0, { contextSnapshot: {} });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      // Different runId → the actor is NOT the active checkout run.
+      targetIssueCheckoutRunId: "99999999-9999-4999-8999-999999999999",
+      kind: "comment",
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "cross_issue_influence_run_context_required" },
+    });
+    expect(fake.inserted).toEqual([]);
+  });
 });
