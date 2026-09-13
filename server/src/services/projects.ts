@@ -1,3 +1,7 @@
+import { execFile } from "node:child_process";
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import { promisify } from "node:util";
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -33,6 +37,77 @@ import { listCurrentRuntimeServicesForProjectWorkspaces } from "./workspace-runt
 import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
 import { mergeProjectWorkspaceRuntimeConfig, readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
+
+const execFileAsync = promisify(execFile);
+const PROJECT_WORKSPACE_GIT_INIT_TIMEOUT_MS = 15_000;
+
+/**
+ * Best-effort `git init` for a `local_path` project workspace.
+ *
+ * The server-side createWorkspace path can persist a workspace row whose cwd
+ * is a plain directory on the agent host (e.g. an archive-restore / preserved
+ * reference project). Git-required adapters such as `claude_local` reject that
+ * workspace at launch with `workspace_validation_failed` because
+ * heartbeat.ts:hasGitMetadata requires `.git` on the resolved cwd. Without a
+ * git-init helper here, every future local_path spin-up has to be patched by
+ * hand after the fact (NET-7494).
+ *
+ * This helper is best-effort: failure to init is logged but does NOT roll back
+ * the DB row, since the directory may legitimately be missing on disk yet
+ * (e.g. the workspace is a remote reference resolved at execution time).
+ */
+/**
+ * @internal Exported for unit testing.
+ */
+export async function ensureLocalPathWorkspaceGitInitialized(
+  cwd: string | null,
+  workspaceId: string,
+  projectId: string,
+): Promise<void> {
+  if (!cwd) return;
+  let stat;
+  try {
+    stat = await fs.lstat(path.resolve(cwd));
+  } catch {
+    return; // path does not exist on disk; nothing to init
+  }
+  if (!stat.isDirectory()) return;
+
+  const gitDir = path.resolve(cwd, ".git");
+  try {
+    const gitStat = await fs.lstat(gitDir);
+    if (gitStat.isDirectory() || gitStat.isFile()) return; // already a git repo
+  } catch {
+    // no .git yet — fall through to init
+  }
+
+  try {
+    await execFileAsync("git", ["init", "--initial-branch=main", cwd], {
+      timeout: PROJECT_WORKSPACE_GIT_INIT_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+    });
+    console.info(
+      `[projects] git-initialized local_path workspace cwd=${cwd} workspaceId=${workspaceId} projectId=${projectId}`,
+    );
+  } catch (err) {
+    // Fall back to a plain `git init` if the platform's git rejects
+    // --initial-branch (older git versions on some agent hosts).
+    try {
+      await execFileAsync("git", ["init", cwd], {
+        timeout: PROJECT_WORKSPACE_GIT_INIT_TIMEOUT_MS,
+        maxBuffer: 1024 * 1024,
+      });
+      console.info(
+        `[projects] git-initialized local_path workspace (fallback) cwd=${cwd} workspaceId=${workspaceId} projectId=${projectId}`,
+      );
+    } catch (err2) {
+      console.warn(
+        `[projects] failed to git-init local_path workspace cwd=${cwd} workspaceId=${workspaceId} projectId=${projectId}:`,
+        err2,
+      );
+    }
+  }
+}
 
 type ProjectRow = typeof projects.$inferSelect;
 type ProjectWorkspaceRow = typeof projectWorkspaces.$inferSelect;
@@ -1053,6 +1128,20 @@ export function projectService(db: Db) {
           .then((rows) => rows[0] ?? null);
         return row;
       });
+
+      // Best-effort `git init` for primary `local_path` workspaces so
+      // git-required adapters (e.g. `claude_local`) can launch without a
+      // manual `git init` round-trip after archive-restore / preserved
+      // reference spin-ups (NET-7494). Failures are logged but do NOT
+      // unwind the workspace row — `cwd` may legitimately be absent on
+      // disk yet (remote reference resolved at execution time).
+      if (created && created.sourceType === "local_path" && created.isPrimary) {
+        await ensureLocalPathWorkspaceGitInitialized(
+          created.cwd,
+          created.id,
+          created.projectId,
+        );
+      }
 
       return created ? toWorkspace(created) : null;
     },
